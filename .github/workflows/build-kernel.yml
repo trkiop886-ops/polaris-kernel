@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [ main ]
-    
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -26,19 +26,27 @@ jobs:
           git checkout $(git rev-list -n 1 --before="2025-01-01 00:00" lineage-21) || true
           git log -1 --format="%h %cd %s" --date=short
 
-      - name: 集成你的 SukiSU(照 build_all.sh)
+      - name: 集成你的 SukiSU(用仓库里的 ksu_src.zip)
         run: |
-          KSU_URL="https://tmpfiles.org/dl/w2wQxxJifFDm/ksu_src.zip"
-          echo "== 下载 KSU 源码包 =="
-          curl -fL --retry 3 --max-time 300 -o ksu_src.zip "$KSU_URL" || true
-          if [ ! -s ksu_src.zip ]; then
-            Z=$(ls *.zip 2>/dev/null | head -1)
-            [ -n "$Z" ] && cp "$Z" ksu_src.zip
+          echo "== 仓库根目录 =="
+          ls -la
+          Z=$(ls *.zip 2>/dev/null | head -1)
+          if [ -z "$Z" ]; then
+            echo "!! 根目录没有 zip,请用 Add file → Upload files 上传 ksu_src.zip"
+            exit 1
           fi
-          if [ ! -s ksu_src.zip ]; then
-            echo "!! 没拿到源码包(链接可能过期 → 喊我重发)"; ls -la; exit 1
-          fi
-          ls -l ksu_src.zip
+          echo "== 使用: $Z =="
+          cp "$Z" ksu_src.zip
+          python3 - <<'PY'
+          import zipfile, sys
+          try:
+              z = zipfile.ZipFile('ksu_src.zip')
+              print('zip 校验 OK, 条目:', len(z.namelist()))
+              assert any(n.startswith('ksu/kernel/') for n in z.namelist()), '里面没有 ksu/kernel/'
+          except Exception as e:
+              print('!! 这不是有效源码包:', e)
+              sys.exit(1)
+          PY
           unzip -q ksu_src.zip -d src
           ls src | head -5
           cd kernel
@@ -49,11 +57,13 @@ jobs:
           grep -q "CONFIG_KSU" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           python3 - <<'PY'
-          p='scripts/Makefile.lib'; s=open(p).read()
-          a="ifeq ($(KBUILD_SRC),)\n__c_flags\t= $(_c_flags)"
-          b="ifeq ($(KBUILD_SRC),)\n__c_flags\t= -I$(srctree)/$(src) $(_c_flags)"
-          if a in s: s=s.replace(a,b,1)
-          open(p,'w').write(s)
+          p = 'scripts/Makefile.lib'
+          s = open(p).read()
+          a = "ifeq ($(KBUILD_SRC),)\n__c_flags\t= $(_c_flags)"
+          b = "ifeq ($(KBUILD_SRC),)\n__c_flags\t= -I$(srctree)/$(src) $(_c_flags)"
+          if a in s:
+              s = s.replace(a, b, 1)
+          open(p, 'w').write(s)
           print('kbuild 头文件路径已修')
           PY
           ls drivers/kernelsu | head -3
@@ -77,13 +87,15 @@ jobs:
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CC=clang-17 CLANG_TRIPLE=aarch64-linux-gnu- HOSTCC=gcc LLVM_IAS=1
           export KCFLAGS="-Wno-incompatible-pointer-types -Wno-ignored-qualifiers -Wno-implicit-function-declaration -Wno-error -fno-pie"
-          export USE_CCACHE=1; ccache -M 5G
+          export USE_CCACHE=1
+          ccache -M 5G
           mkdir -p /tmp/arm32
           for f in /usr/bin/arm-linux-gnueabi-*; do ln -sf "$f" "/tmp/arm32/$(basename "$f" | sed 's/^arm-linux-gnueabi-//')"; done
           export CROSS_COMPILE_ARM32=/tmp/arm32/
           cd kernel
-          grep -rl -- '-Werror' . --include=Makefile 2>/dev/null | grep -v '^./out' | while read f; do \
-            sed -i 's/-Werror=/-Wno-error=/g; s/-Werror-/-Wno-error=/g; s/-Werror\b/-Wno-error/g' "$f"; done
+          grep -rl -- '-Werror' . --include=Makefile 2>/dev/null | grep -v '^./out' | while read f; do
+            sed -i 's/-Werror=/-Wno-error=/g; s/-Werror-/-Wno-error=/g; s/-Werror\b/-Wno-error/g' "$f"
+          done
           echo "==== 第1轮: Image.gz-dtb ===="
           make -j$(nproc --all) Image.gz-dtb 2>&1 | tee build.log
           if [ ! -f arch/arm64/boot/Image.gz-dtb ]; then
@@ -100,10 +112,12 @@ jobs:
           if [ ! -f arch/arm64/boot/Image.gz-dtb ] && [ ! -f arch/arm64/boot/Image.gz ]; then
             echo "======== 失败, 真错误如下 ========"
             grep -nE "error:|Error [0-9]" build.log | tail -30
-            echo "---------------- tail -20 ----------------"; tail -20 build.log
+            echo "---------------- tail -20 ----------------"
+            tail -20 build.log
             exit 1
           fi
-          echo "==== 成功 ===="; ls -lh arch/arm64/boot/ | head -6
+          echo "==== 成功 ===="
+          ls -lh arch/arm64/boot/ | head -6
           strings arch/arm64/boot/Image.gz-dtb arch/arm64/boot/Image 2>/dev/null | grep -m1 "Linux version" || true
 
       - name: 打包 AnyKernel3(TWRP 卡刷包)
@@ -111,14 +125,171 @@ jobs:
           git clone https://github.com/osm0sis/AnyKernel3 --depth=1
           cd AnyKernel3
           rm -f Image* zImage* 2>/dev/null || true
-          if   [ -f ../kernel/arch/arm64/boot/Image.gz-dtb ]; then cp ../kernel/arch/arm64/boot/Image.gz-dtb ./Image.gz
-          elif [ -f ../kernel/arch/arm64/boot/Image.gz ];     then cp ../kernel/arch/arm64/boot/Image.gz ./Image.gz
-          else cp ../kernel/arch/arm64/boot/Image ./Image; fi
+          if [ -f ../kernel/arch/arm64/boot/Image.gz-dtb ]; then
+            cp ../kernel/arch/arm64/boot/Image.gz-dtb ./Image.gz
+          elif [ -f ../kernel/arch/arm64/boot/Image.gz ]; then
+            cp ../kernel/arch/arm64/boot/Image.gz ./Image.gz
+          else
+            cp ../kernel/arch/arm64/boot/Image ./Image
+          fi
           ls -l Image*
           sed -i 's/device.name1=.*/device.name1=polaris/' anykernel.sh
           sed -i 's|block=.*|block=/dev/block/bootdevice/by-name/boot;|' anykernel.sh
           zip -r9 ../polaris-ksu-$(date +%Y%m%d).zip *
-          cd ..; unzip -l polaris-ksu-*.zip | head -20
+          cd ..
+          unzip -l polaris-ksu-*.zip | head -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: polaris-ksu-zip
+          path: polaris-ksu-*.zip
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: kernel/build.log
+          if-no-files-found: ignorename: Build Polaris Kernel (lineage-21 + clang17 + 你的 SukiSU)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装工具链
+        run: |
+          sudo apt update
+          sudo apt install -y clang-17 llvm-17 make bison flex bc libssl-dev libelf-dev \
+            zip unzip ccache binutils binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu gcc-arm-linux-gnueabi
+          clang-17 --version | head -2
+
+      - name: 拉内核源码(lineage-21, 钉到 2024-12)
+        run: |
+          git clone https://github.com/LineageOS/android_kernel_xiaomi_sdm845 kernel -b lineage-21 --depth=400
+          cd kernel
+          git checkout $(git rev-list -n 1 --before="2025-01-01 00:00" lineage-21) || true
+          git log -1 --format="%h %cd %s" --date=short
+
+      - name: 集成你的 SukiSU(用仓库里的 ksu_src.zip)
+        run: |
+          echo "== 仓库根目录 =="
+          ls -la
+          Z=$(ls *.zip 2>/dev/null | head -1)
+          if [ -z "$Z" ]; then
+            echo "!! 根目录没有 zip,请用 Add file → Upload files 上传 ksu_src.zip"
+            exit 1
+          fi
+          echo "== 使用: $Z =="
+          cp "$Z" ksu_src.zip
+          python3 - <<'PY'
+          import zipfile, sys
+          try:
+              z = zipfile.ZipFile('ksu_src.zip')
+              print('zip 校验 OK, 条目:', len(z.namelist()))
+              assert any(n.startswith('ksu/kernel/') for n in z.namelist()), '里面没有 ksu/kernel/'
+          except Exception as e:
+              print('!! 这不是有效源码包:', e)
+              sys.exit(1)
+          PY
+          unzip -q ksu_src.zip -d src
+          ls src | head -5
+          cd kernel
+          rm -rf KernelSU drivers/kernelsu
+          mkdir -p KernelSU
+          cp -r ../src/ksu/kernel KernelSU/kernel
+          ln -sf ../KernelSU/kernel drivers/kernelsu
+          grep -q "CONFIG_KSU" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          python3 - <<'PY'
+          p = 'scripts/Makefile.lib'
+          s = open(p).read()
+          a = "ifeq ($(KBUILD_SRC),)\n__c_flags\t= $(_c_flags)"
+          b = "ifeq ($(KBUILD_SRC),)\n__c_flags\t= -I$(srctree)/$(src) $(_c_flags)"
+          if a in s:
+              s = s.replace(a, b, 1)
+          open(p, 'w').write(s)
+          print('kbuild 头文件路径已修')
+          PY
+          ls drivers/kernelsu | head -3
+
+      - name: 写配置(你的 utopia.config + KSU + vermagic 伪装)
+        run: |
+          cd kernel
+          cp ../src/utopia.config .config
+          ./scripts/config --file .config \
+            -d DEBUG_INFO -d DEBUG_INFO_REDUCED -d DEBUG_INFO_SPLIT -d CC_WERROR \
+            -e KSU -d KSU_SUSFS -d KSU_SUSFS_SUS_PATH -d KSU_SUSFS_SUS_MOUNT \
+            --set-str LOCALVERSION "-perf-g88606771eef3" -d LOCALVERSION_AUTO
+          make ARCH=arm64 olddefconfig >/dev/null
+          echo "== 配置检查 =="
+          grep -E '^CONFIG_KSU|^CONFIG_LOCALVERSION=|^CONFIG_BUILD_ARM64_APPENDED_DTB' .config || true
+
+      - name: 编译(clang-17, 失败自动打印真错误)
+        run: |
+          set +e
+          export ARCH=arm64 SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CC=clang-17 CLANG_TRIPLE=aarch64-linux-gnu- HOSTCC=gcc LLVM_IAS=1
+          export KCFLAGS="-Wno-incompatible-pointer-types -Wno-ignored-qualifiers -Wno-implicit-function-declaration -Wno-error -fno-pie"
+          export USE_CCACHE=1
+          ccache -M 5G
+          mkdir -p /tmp/arm32
+          for f in /usr/bin/arm-linux-gnueabi-*; do ln -sf "$f" "/tmp/arm32/$(basename "$f" | sed 's/^arm-linux-gnueabi-//')"; done
+          export CROSS_COMPILE_ARM32=/tmp/arm32/
+          cd kernel
+          grep -rl -- '-Werror' . --include=Makefile 2>/dev/null | grep -v '^./out' | while read f; do
+            sed -i 's/-Werror=/-Wno-error=/g; s/-Werror-/-Wno-error=/g; s/-Werror\b/-Wno-error/g' "$f"
+          done
+          echo "==== 第1轮: Image.gz-dtb ===="
+          make -j$(nproc --all) Image.gz-dtb 2>&1 | tee build.log
+          if [ ! -f arch/arm64/boot/Image.gz-dtb ]; then
+            echo "==== 第2轮: 关掉 COMPAT_VDSO 重编 ===="
+            ./scripts/config --file .config -d COMPAT_VDSO
+            make ARCH=arm64 olddefconfig >/dev/null
+            make -j$(nproc --all) Image.gz-dtb 2>&1 | tee -a build.log
+          fi
+          if [ ! -f arch/arm64/boot/Image.gz-dtb ]; then
+            echo "==== 第3轮: 退到 Image ===="
+            make -j$(nproc --all) Image 2>&1 | tee -a build.log
+            gzip -9c arch/arm64/boot/Image > arch/arm64/boot/Image.gz 2>/dev/null
+          fi
+          if [ ! -f arch/arm64/boot/Image.gz-dtb ] && [ ! -f arch/arm64/boot/Image.gz ]; then
+            echo "======== 失败, 真错误如下 ========"
+            grep -nE "error:|Error [0-9]" build.log | tail -30
+            echo "---------------- tail -20 ----------------"
+            tail -20 build.log
+            exit 1
+          fi
+          echo "==== 成功 ===="
+          ls -lh arch/arm64/boot/ | head -6
+          strings arch/arm64/boot/Image.gz-dtb arch/arm64/boot/Image 2>/dev/null | grep -m1 "Linux version" || true
+
+      - name: 打包 AnyKernel3(TWRP 卡刷包)
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3 --depth=1
+          cd AnyKernel3
+          rm -f Image* zImage* 2>/dev/null || true
+          if [ -f ../kernel/arch/arm64/boot/Image.gz-dtb ]; then
+            cp ../kernel/arch/arm64/boot/Image.gz-dtb ./Image.gz
+          elif [ -f ../kernel/arch/arm64/boot/Image.gz ]; then
+            cp ../kernel/arch/arm64/boot/Image.gz ./Image.gz
+          else
+            cp ../kernel/arch/arm64/boot/Image ./Image
+          fi
+          ls -l Image*
+          sed -i 's/device.name1=.*/device.name1=polaris/' anykernel.sh
+          sed -i 's|block=.*|block=/dev/block/bootdevice/by-name/boot;|' anykernel.sh
+          zip -r9 ../polaris-ksu-$(date +%Y%m%d).zip *
+          cd ..
+          unzip -l polaris-ksu-*.zip | head -20
 
       - uses: actions/upload-artifact@v4
         with:
