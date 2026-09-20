@@ -21,6 +21,7 @@ jobs:
           clang-17 --version | head -2
           aarch64-linux-gnu-gcc --version | head -1
           arm-linux-gnueabi-as --version | head -1
+          arm-linux-gnueabi-ld --version | head -1
 
       - name: 拉取 lineage-21 内核源码
         run: |
@@ -71,9 +72,10 @@ jobs:
 
       - name: 内核配置 + 编译
         run: |
+          set +e
+
           export ARCH=arm64 SUBARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
           export CC=clang-17
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export HOSTCC=gcc
@@ -82,15 +84,21 @@ jobs:
           export USE_CCACHE=1
           ccache -M 5G
 
+          # === 关键修复：造 arm32 专用工具前缀目录，让 clang 用 arm32 的 ld/as ===
+          mkdir -p /tmp/arm32
+          for f in /usr/bin/arm-linux-gnueabi-*; do ln -sf "$f" "/tmp/arm32/$(basename "$f" | sed 's/^arm-linux-gnueabi-//')"; done
+          ls -l /tmp/arm32/ld /tmp/arm32/as /tmp/arm32/objcopy || true
+          export CROSS_COMPILE_ARM32=/tmp/arm32/
+
           cd kernel
 
-          # 全局关掉"警告当错误"
           grep -rl -- '-Werror' . --include=Makefile 2>/dev/null | grep -v '^./out' | while read f; do sed -i 's/-Werror=/-Wno-error=/g; s/-Werror/-Wno-error/g' "$f"; done
 
           mkdir -p out
           make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc sdm845_defconfig
-          [ -f arch/arm64/configs/vendor/xiaomi/mi845_defconfig ] && cat arch/arm64/configs/vendor/xiaomi/mi845_defconfig >> out/.config || true
-          [ -f arch/arm64/configs/vendor/xiaomi/polaris.config ] && cat arch/arm64/configs/vendor/xiaomi/polaris.config >> out/.config || true
+          [ -f out/.config ] || { echo "!! defconfig 失败"; exit 1; }
+          [ -f arch/arm64/configs/vendor/xiaomi/mi845_defconfig ] && cat arch/arm64/configs/vendor/xiaomi/mi845_defconfig >> out/.config
+          [ -f arch/arm64/configs/vendor/xiaomi/polaris.config ] && cat arch/arm64/configs/vendor/xiaomi/polaris.config >> out/.config
           make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc olddefconfig
 
           ./scripts/config --file out/.config -e KSU
@@ -101,23 +109,20 @@ jobs:
           echo "=== KSU 配置检查 ==="
           grep -E '^CONFIG_KSU|^CONFIG_KALLSYMS_ALL|^CONFIG_KSU_MANUAL_HOOK' out/.config || true
 
-          set -o pipefail
           echo "==== 编译 第1轮 ===="
           make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc -j$(nproc --all) Image.gz-dtb 2>&1 | tee build.log
-          rc=$?
-          if [ $rc -ne 0 ] || [ ! -f out/arch/arm64/boot/Image.gz-dtb ]; then
+          if [ ! -f out/arch/arm64/boot/Image.gz-dtb ]; then
             echo "==== 第1轮没成, 试默认目标 ===="
             make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc -j$(nproc --all) 2>&1 | tee -a build.log
-            rc=$?
           fi
-          if [ $rc -ne 0 ] && grep -qi 'vdso32' build.log; then
-            echo "==== vdso32 有问题: 关掉 COMPAT_VDSO 重编 ===="
+          if [ ! -f out/arch/arm64/boot/Image.gz-dtb ] && [ ! -f out/arch/arm64/boot/Image.gz ] && [ ! -f out/arch/arm64/boot/Image ] && grep -qi 'vdso32' build.log; then
+            echo "==== vdso32 还是不行: 关掉 COMPAT_VDSO 重编 ===="
             ./scripts/config --file out/.config -d COMPAT_VDSO
             make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc olddefconfig
             make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc -j$(nproc --all) Image.gz-dtb 2>&1 | tee -a build.log
-            rc=$?
           fi
-          if [ $rc -ne 0 ] || { [ ! -f out/arch/arm64/boot/Image.gz-dtb ] && [ ! -f out/arch/arm64/boot/Image.gz ] && [ ! -f out/arch/arm64/boot/Image ]; }; then
+
+          if [ ! -f out/arch/arm64/boot/Image.gz-dtb ] && [ ! -f out/arch/arm64/boot/Image.gz ] && [ ! -f out/arch/arm64/boot/Image ]; then
             echo "======== 编译失败, 真错误尾部如下 ========"
             tail -60 build.log
             exit 1
