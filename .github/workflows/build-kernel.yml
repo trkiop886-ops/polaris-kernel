@@ -68,6 +68,34 @@ jobs:
           cp -f $S/include/linux/susfs.h $S/include/linux/susfs_def.h $S/include/linux/sus_su.h include/linux/ 2>/dev/null || true
           echo "== 打内核补丁(允许部分失败, 下面手工补) =="
           patch -p1 --forward --no-backup-if-mismatch < $S/50_add_susfs_in_kernel-4.9.patch || true
+          echo "== 补 8 个新版 SUSFS 常量(这套 KSU 源要用, 4.9 老分支里还没有) =="
+          cat >> include/linux/susfs_def.h <<'EOF'
+
+          #ifndef SUSFS_MAGIC
+          #define SUSFS_MAGIC 0xFAFAFAFA
+          #endif
+          #ifndef CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH
+          #define CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH 0x55551
+          #endif
+          #ifndef CMD_SUSFS_SET_SDCARD_ROOT_PATH
+          #define CMD_SUSFS_SET_SDCARD_ROOT_PATH 0x55552
+          #endif
+          #ifndef CMD_SUSFS_ADD_SUS_PATH_LOOP
+          #define CMD_SUSFS_ADD_SUS_PATH_LOOP 0x55553
+          #endif
+          #ifndef CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS
+          #define CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS 0x55561
+          #endif
+          #ifndef CMD_SUSFS_UMOUNT_FOR_ZYGOTE_ISO_SERVICE
+          #define CMD_SUSFS_UMOUNT_FOR_ZYGOTE_ISO_SERVICE 0x55562
+          #endif
+          #ifndef CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING
+          #define CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING 0x60010
+          #endif
+          #ifndef CMD_SUSFS_ADD_SUS_MAP
+          #define CMD_SUSFS_ADD_SUS_MAP 0x60020
+          #endif
+          EOF
           echo "== 手工补那两处(LineageOS 版本差异) =="
           python3 - <<'PY'
           def rd(p): return open(p).read()
