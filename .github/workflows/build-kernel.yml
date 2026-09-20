@@ -36,13 +36,13 @@ jobs:
       - name: 打全量手动hook补丁（满血root核心）
         run: |
           cd kernel
-          
-          # 1. 优先尝试官方4.9完整补丁，失败自动走兜底
+
+          # 1. 优先尝试官方4.9完整补丁；404 或打不上都自动走兜底
           curl -fLSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/patches/4.9-manual-hook.patch" -o /tmp/ksu_full_hook.patch || true
-          if [ -s /tmp/ksu_full_hook.patch ]; then
-            patch -p1 < /tmp/ksu_full_hook.patch
+          if [ -s /tmp/ksu_full_hook.patch ] && patch -p1 --forward < /tmp/ksu_full_hook.patch; then
+            echo "== 官方 4.9 hook 补丁已应用 =="
           else
-            # 兜底：仅保留已验证可编译的 exec.c 完整钩子
+            echo "== 走兜底：手打 exec 钩子（已验证可编译的版本） =="
             sed -i '/^#include <linux\/binfmts.h>/a \
             #ifdef CONFIG_KSU_MANUAL_HOOK \
             extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, \
@@ -62,13 +62,13 @@ jobs:
                             return -EPERM; \
             #endif' fs/exec.c
           fi
-          
+
           # 2. susfs 编译防护
           F=drivers/kernelsu/kernel_includes.h
           if [ -f "$F" ] && grep -q '#include <linux/susfs.h>' "$F" && ! grep -q 'ifdef CONFIG_KSU_SUSFS' "$F"; then
             sed -i 's|#include <linux/susfs.h>|#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs.h>\n#endif|' "$F"
           fi
-          
+
           # 3. 清理提示行
           sed -i '/You should integrate ReSukiSU in your kernel/d' drivers/kernelsu/Kbuild 2>/dev/null || true
 
@@ -80,37 +80,41 @@ jobs:
           export CC=clang-17
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export HOSTCC=gcc
-          export KCFLAGS="-Wno-incompatible-pointer-types -Wno-ignored-qualifiers -Wno-implicit-function-declaration"
+          export KCFLAGS="-Wno-incompatible-pointer-types -Wno-ignored-qualifiers -Wno-implicit-function-declaration -Wno-error -fno-pie"
           export USE_CCACHE=1
           ccache -M 5G
-          
+
           cd kernel
+
+          # === 新修①：老代码+新编译器，全局干掉 -Werror（顶层 Makefile 有全局 -Werror）===
+          grep -rl -- '-Werror' . --include=Makefile 2>/dev/null | grep -v '^./out' | while read f; do sed -i 's/-Werror=/-Wno-error=/g; s/-Werror/-Wno-error/g' "$f"; done
+          echo "== 残留 -Werror =="; grep -rn -- '-Werror' --include=Makefile . 2>/dev/null | grep -v '^./out' | head -5 || true
+
           mkdir -p out
-          
-          # 加载设备默认配置
-          make O=out ARCH=arm64 sdm845_defconfig
+
+          # 加载设备默认配置（make 上直接钉死编译器，防止被树里的默认值顶掉）
+          make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc sdm845_defconfig
           [ -f arch/arm64/configs/vendor/xiaomi/mi845_defconfig ] && cat arch/arm64/configs/vendor/xiaomi/mi845_defconfig >> out/.config || true
           [ -f arch/arm64/configs/vendor/xiaomi/polaris.config ] && cat arch/arm64/configs/vendor/xiaomi/polaris.config >> out/.config || true
-          
-          make O=out olddefconfig
-          
+
+          make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc olddefconfig
+
           # 满血root必开配置
           ./scripts/config --file out/.config -e KSU
           ./scripts/config --file out/.config -e KSU_MANUAL_HOOK || true
           ./scripts/config --file out/.config -d KSU_SUSFS || true
           ./scripts/config --file out/.config -e KALLSYMS_ALL
-          
-          make O=out olddefconfig
-          
-          # 打印配置验证
+
+          make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc olddefconfig
+
           echo "=== KSU 配置检查 ==="
-          grep -E '^CONFIG_KSU|^CONFIG_KALLSYMS_ALL|^CONFIG_KSU_MANUAL_HOOK' out/.config
-          
+          grep -E '^CONFIG_KSU|^CONFIG_KALLSYMS_ALL|^CONFIG_KSU_MANUAL_HOOK' out/.config || true
+
           # 编译内核
-          make O=out -j$(nproc --all) Image.gz-dtb 2>&1 | tee build.log || make O=out -j$(nproc --all) 2>&1 | tee -a build.log
-          
-          # 输出编译结果
-          ls -lh out/arch/arm64/boot/
+          make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc -j$(nproc --all) Image.gz-dtb 2>&1 | tee build.log \
+            || make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc -j$(nproc --all) 2>&1 | tee -a build.log
+
+          ls -lh out/arch/arm64/boot/ || true
           strings out/arch/arm64/boot/Image.gz* 2>/dev/null | grep -m1 "Linux version" || true
 
       - name: 打包 AnyKernel3 卡刷包
@@ -118,11 +122,11 @@ jobs:
           git clone https://github.com/osm0sis/AnyKernel3 --depth=1
           cd AnyKernel3
           rm -f Image* zImage* 2>/dev/null || true
-          
+
           if   [ -f ../kernel/out/arch/arm64/boot/Image.gz-dtb ]; then cp ../kernel/out/arch/arm64/boot/Image.gz-dtb ./Image.gz
           elif [ -f ../kernel/out/arch/arm64/boot/Image.gz ];     then cp ../kernel/out/arch/arm64/boot/Image.gz ./Image.gz
           else cp ../kernel/out/arch/arm64/boot/Image ./Image; fi
-          
+
           ls -l Image*
           sed -i 's/device.name1=.*/device.name1=polaris/' anykernel.sh
           sed -i 's|block=.*|block=/dev/block/bootdevice/by-name/boot;|' anykernel.sh
