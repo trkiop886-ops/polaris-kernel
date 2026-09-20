@@ -11,12 +11,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install toolchain (clang-17)
+      - name: Install toolchain (clang-17 + aarch64 binutils)
         run: |
           sudo apt update
           sudo apt install -y clang-17 llvm-17 make bison flex bc libssl-dev libelf-dev \
-            zip unzip ccache binutils gcc-arm-linux-gnueabi
+            zip unzip ccache binutils binutils-aarch64-linux-gnu gcc gcc-arm-linux-gnueabi
           clang-17 --version | head -2
+          aarch64-linux-gnu-ld --version | head -1
 
       - name: Clone lineage-21 (pin to Dec 2024)
         run: |
@@ -60,9 +61,13 @@ jobs:
       - name: Configure and build
         run: |
           export ARCH=arm64 SUBARCH=arm64
-          export CROSS_COMPILE= CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-          export CC=clang-17 LD=ld.bfd HOSTCC=clang-17 HOSTLD=ld.bfd
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          export CC=clang-17
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export HOSTCC=gcc
           export USE_CCACHE=1; ccache -M 5G
+          echo "CC=$CC  CROSS=$CROSS_COMPILE  TRIPLE=$CLANG_TRIPLE"
           cd kernel; mkdir -p out
           make O=out ARCH=arm64 sdm845_defconfig
           [ -f arch/arm64/configs/vendor/xiaomi/mi845_defconfig ] && cat arch/arm64/configs/vendor/xiaomi/mi845_defconfig >> out/.config || true
