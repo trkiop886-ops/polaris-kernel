@@ -1,517 +1,273 @@
-
-name: Build Polaris Kernel (lineage-21 + clang17 + ReSukiSU manual-hook)
+name: Polaris ReSukiSU Kernel Build
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
+    paths:
+      - ".github/workflows/polaris.yml"
 
 permissions:
   contents: read
 
+concurrency:
+  group: polaris-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      KERNEL_REPO: https://github.com/LineageOS/android_kernel_xiaomi_sdm845.git
+      KERNEL_BRANCH: lineage-21
+      KERNEL_COMMIT: 88606771eef343b0a2158de455a9537fba17b2f2
+      DEFCONFIG: vendor/xiaomi/mi845_defconfig
+      DEVICE_CONFIG: vendor/xiaomi/polaris.config
+      IMAGE_NAME: Image.gz-dtb
+      ANYKERNEL_REPO: https://github.com/osm0sis/AnyKernel3.git
 
     steps:
       - name: Checkout workflow repository
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install dependencies
+        shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y \
-            clang-17 llvm-17 make bison flex bc libssl-dev libelf-dev \
-            zip unzip ccache binutils binutils-aarch64-linux-gnu \
-            binutils-arm-linux-gnueabi gcc-aarch64-linux-gnu \
-            g++-aarch64-linux-gnu gcc-arm-linux-gnueabi \
-            patch python3 git curl
-          clang-17 --version | head -2
+          sudo apt-get install -y bc bison build-essential ccache curl flex git \
+            libelf-dev libssl-dev lld-14 llvm-14 clang-14 gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi device-tree-compiler python3 zip unzip rsync \
+            dwarves file
 
-      - name: Fetch kernel source (LineageOS 21)
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: polaris-clang-${{ runner.os }}-${{ env.KERNEL_COMMIT }}-${{ hashFiles('.github/workflows/polaris.yml') }}
+          restore-keys: |
+            polaris-clang-${{ runner.os }}-${{ env.KERNEL_COMMIT }}-
+
+      - name: Fetch pinned kernel source
+        shell: bash
         run: |
           set -euo pipefail
-          git clone \
-            https://github.com/LineageOS/android_kernel_xiaomi_sdm845 \
-            kernel \
-            --branch lineage-21 \
-            --depth=400
-
+          git init kernel
           cd kernel
+          git remote add origin "$KERNEL_REPO"
+          git fetch --no-tags --depth=1 origin "$KERNEL_COMMIT"
+          git checkout --detach FETCH_HEAD
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$KERNEL_COMMIT" || {
+            echo "::error::Kernel SHA mismatch: $actual"; exit 1; }
+          echo "KERNEL_SHA=$actual" >> "$GITHUB_ENV"
+          test -f "arch/arm64/configs/$DEFCONFIG"
+          test -f "arch/arm64/configs/$DEVICE_CONFIG"
+          git log -1 --format='%H %s'
 
-          BASE_COMMIT="$(git rev-list -n 1 --before="2025-01-01 00:00:00" lineage-21)"
-          if [ -n "$BASE_COMMIT" ]; then
-            git checkout "$BASE_COMMIT"
-          else
-            echo "::error::Could not find a LineageOS 21 commit before 2025-01-01"
-            exit 1
-          fi
-
-          echo "Kernel source commit:"
-          git log -1 --format="%H%n%cd%n%s" --date=iso-strict
-
-      - name: Integrate ReSukiSU and select a compatible tag
+      - name: Install ReSukiSU
+        shell: bash
         run: |
           set -euo pipefail
           cd kernel
-
-          curl -fL --retry 3 \
-            "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" \
+          curl -fL --retry 4 --retry-delay 3 \
+            https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh \
             -o /tmp/resukisu-setup.sh
-
           bash /tmp/resukisu-setup.sh
-
-          if [ ! -d KernelSU/.git ]; then
-            echo "::error::KernelSU directory or Git repository was not created by setup.sh"
+          if [ ! -d KernelSU ] && [ ! -d drivers/kernelsu ]; then
+            echo "::error::ReSukiSU installer did not create a recognized KernelSU source directory."
             exit 1
           fi
+          find . -maxdepth 4 -iname '*kernelsu*' -o -iname '*ksu*' | head -80
 
-          cd KernelSU
-          git fetch --force --tags origin
-
-          PICK=""
-          for T in v3.2.0 v3.1.9 v3.1.8 v3.1.7; do
-            if ! git rev-parse --verify "refs/tags/$T^{commit}" >/dev/null 2>&1; then
-              echo "Tag not found: $T"
-              continue
-            fi
-
-            git checkout --detach -f "$T"
-
-            D="$(grep -RIlE '(^|[[:space:]])ksu_handle_execveat[[:space:]]*\(' kernel \
-              --include='*.c' --include='*.h' 2>/dev/null | wc -l)"
-            F="$(grep -RIlE '(^|[[:space:]])ksu_handle_faccessat[[:space:]]*\(' kernel \
-              --include='*.c' --include='*.h' 2>/dev/null | wc -l)"
-            S="$(grep -RIlE '(^|[[:space:]])ksu_handle_stat[[:space:]]*\(' kernel \
-              --include='*.c' --include='*.h' 2>/dev/null | wc -l)"
-
-            echo "== $T : files mentioning execveat=$D faccessat=$F stat=$S"
-
-            if [ "$D" -ge 1 ] && [ "$F" -ge 1 ] && [ "$S" -ge 1 ]; then
-              PICK="$T"
-              break
+      - name: Automatically integrate legacy ReSukiSU hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd kernel
+          # This project publishes a hook script intended for legacy non-GKI kernels.
+          # Fetch the repository and discover the script instead of requiring a user patch.
+          git clone --depth=1 https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd.git /tmp/non-gki-tools
+          hook_script="$(find /tmp/non-gki-tools -type f -name syscall_hook_patches.sh -print -quit)"
+          test -n "$hook_script" || { echo '::error::Upstream syscall_hook_patches.sh not found'; exit 1; }
+          bash "$hook_script"
+          git diff --check
+          # Reject partial integrations: each mandatory syscall hook must appear in
+          # the expected translation unit after the upstream patch script completes.
+          declare -A required_hooks=(
+            [fs/stat.c]=ksu_handle_stat
+            [fs/open.c]=ksu_handle_faccessat
+            [fs/exec.c]=ksu_handle_execveat
+            [kernel/reboot.c]=ksu_handle_sys_reboot
+            [fs/read_write.c]=ksu_handle_sys_read
+            [kernel/sys.c]=ksu_handle_setresuid
+          )
+          for source in "${!required_hooks[@]}"; do
+            if ! grep -q "${required_hooks[$source]}" "$source"; then
+              echo "::error::Required hook missing after auto integration: $source (${required_hooks[$source]})"
+              exit 1
             fi
           done
-
-          if [ -z "$PICK" ]; then
-            echo "::error::No candidate tag passed the symbol-presence check"
-            exit 1
+          for handler in ksu_handle_post_execveat ksu_handle_newfstat_ret; do
+            if ! grep -Rqs "$handler" fs kernel --include='*.c' --include='*.h'; then
+              echo "::error::Required ReSukiSU handler symbol missing: $handler"
+              exit 1
+            fi
+          done
+          if find . -type f -name '*.rej' -print -quit | grep -q .; then
+            echo '::error::Hook integration left reject files'; exit 1
           fi
-
-          git checkout --detach -f "$PICK"
-          echo "Selected ReSukiSU tag: $PICK"
-          echo "Selected ReSukiSU commit: $(git rev-parse HEAD)"
           git status --short
-          git describe --tags --always
 
-      - name: Insert manual hooks and apply legacy macro guard
+      - name: Configure kernel
+        shell: bash
         run: |
           set -euo pipefail
           cd kernel
+          export ARCH SUBARCH
+          export PATH="/usr/lib/llvm-14/bin:$PATH"
+          export CC="ccache clang-14"
+          export LD=ld.lld-14 AR=llvm-ar-14 NM=llvm-nm-14
+          export OBJCOPY=llvm-objcopy-14 OBJDUMP=llvm-objdump-14 STRIP=llvm-strip-14
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          ccache -M 5G
+          make O="$GITHUB_WORKSPACE/out" "$DEFCONFIG"
+          cat "arch/arm64/configs/$DEVICE_CONFIG" >> "$GITHUB_WORKSPACE/out/.config"
+          scripts/config --file "$GITHUB_WORKSPACE/out/.config" \
+            -e KSU -e KSU_MANUAL_HOOK -e KALLSYMS -e KALLSYMS_ALL
+          make O="$GITHUB_WORKSPACE/out" olddefconfig
+          cfg="$GITHUB_WORKSPACE/out/.config"
+          for opt in CONFIG_KSU CONFIG_KSU_MANUAL_HOOK CONFIG_KALLSYMS CONFIG_KALLSYMS_ALL; do
+            grep -qx "$opt=y" "$cfg" || {
+              echo "::error::$opt was not enabled by Kconfig"; exit 1; }
+          done
+          grep -E '^(CONFIG_KSU|CONFIG_KSU_MANUAL_HOOK|CONFIG_KALLSYMS|CONFIG_KALLSYMS_ALL)=' "$cfg"
 
-          python3 - <<'PY'
+      - name: Relax legacy Werror flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd kernel
+          while IFS= read -r -d '' f; do
+            sed -i -E \
+              -e 's/-Werror=/-Wno-error=/g' \
+              -e 's/-Werror-/-Wno-error-/g' \
+              -e 's/-Werror([[:space:]]|$)/-Wno-error\1/g' "$f"
+          done < <(find . -type f -name Makefile -not -path './.git/*' -print0)
+
+      - name: Build Image.gz-dtb
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd kernel
+          export ARCH SUBARCH
+          export PATH="/usr/lib/llvm-14/bin:$PATH"
+          export CC="ccache clang-14"
+          export LD=ld.lld-14 AR=llvm-ar-14 NM=llvm-nm-14
+          export OBJCOPY=llvm-objcopy-14 OBJDUMP=llvm-objdump-14 STRIP=llvm-strip-14
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          export KBUILD_BUILD_USER=github-actions
+          export KBUILD_BUILD_HOST=polaris
+          set -o pipefail
+          make -j"$(nproc)" O="$GITHUB_WORKSPACE/out" Image.gz-dtb 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Verify kernel image
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="$GITHUB_WORKSPACE/out/arch/arm64/boot/$IMAGE_NAME"
+          test -s "$IMAGE" || { echo "::error::Kernel image missing"; exit 1; }
+          file "$IMAGE"
+          ls -lh "$IMAGE"
+
+      - name: Automatically prepare AnyKernel3 for Polaris
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          test -s AnyKernel3/anykernel.sh
+          python3 <<'PY'
           from pathlib import Path
           import re
-          import sys
 
-          def read(path):
-              p = Path(path)
-              if not p.is_file():
-                  raise RuntimeError(f"Required source file does not exist: {path}")
-              return p.read_text()
+          p = Path("AnyKernel3/anykernel.sh")
+          s = p.read_text(errors="strict")
 
-          def write(path, text):
-              Path(path).write_text(text)
+          # AnyKernel3 device identifiers belong in its properties() string.
+          prop = re.search(r"(?ms)(properties\(\)\s*\{\s*')(.*?)(\n'\s*;\s*\})", s)
+          if not prop:
+              raise SystemExit("Unrecognized AnyKernel3 properties() block; refusing unsafe edit")
+          body = prop.group(2)
+          if not re.search(r"(?m)^device\.name[0-9]*=", body):
+              raise SystemExit("No device.name property in AnyKernel3 properties block")
+          body, count = re.subn(r"(?m)^device\.name[0-9]*=.*$", "", body)
+          body = body.rstrip() + "\ndevice.name1=polaris"
+          s = s[:prop.start(2)] + body + s[prop.end(2):]
 
-          def find_function_body(text, anchor, path):
-              start = text.find(anchor)
-              if start < 0:
-                  raise RuntimeError(f"Function anchor not found in {path}: {anchor}")
+          # Support both legacy lowercase and current uppercase AK3 shell variables.
+          for key, value in (("BLOCK", "auto"), ("IS_SLOT_DEVICE", "auto"),
+                             ("RAMDISK_COMPRESSION", "auto")):
+              variants = (key, key.lower())
+              found = False
+              for name in variants:
+                  pattern = rf"(?m)^{name}=[^;]*;"
+                  if re.search(pattern, s):
+                      s, n = re.subn(pattern, f"{name}={value};", s, count=1)
+                      found = n == 1
+                      break
+              if not found:
+                  raise SystemExit(f"AnyKernel3 variable {key} not found; refusing to append a potentially ineffective setting")
 
-              # Find the first opening brace after the function anchor.
-              brace = text.find("{", start + len(anchor))
-              if brace < 0:
-                  raise RuntimeError(f"Function body opening brace not found in {path}: {anchor}")
-
-              # Match braces while ignoring braces inside comments and literals.
-              depth = 0
-              i = brace
-              state = "code"
-              while i < len(text):
-                  c = text[i]
-                  n = text[i + 1] if i + 1 < len(text) else ""
-
-                  if state == "code":
-                      if c == "/" and n == "*":
-                          state = "block_comment"
-                          i += 2
-                          continue
-                      if c == "/" and n == "/":
-                          state = "line_comment"
-                          i += 2
-                          continue
-                      if c == '"':
-                          state = "string"
-                          i += 1
-                          continue
-                      if c == "'":
-                          state = "char"
-                          i += 1
-                          continue
-                      if c == "{":
-                          depth += 1
-                      elif c == "}":
-                          depth -= 1
-                          if depth == 0:
-                              return brace, i
-                  elif state == "block_comment":
-                      if c == "*" and n == "/":
-                          state = "code"
-                          i += 2
-                          continue
-                  elif state == "line_comment":
-                      if c == "\n":
-                          state = "code"
-                  elif state in ("string", "char"):
-                      if c == "\\":
-                          i += 2
-                          continue
-                      if (state == "string" and c == '"') or (state == "char" and c == "'"):
-                          state = "code"
-
-                  i += 1
-
-              raise RuntimeError(f"Could not match function braces in {path}: {anchor}")
-
-          def insert_function(path, anchor, block, tag):
-              text = read(path)
-              if tag in text:
-                  raise RuntimeError(f"Hook marker already exists in {path}: {tag}")
-
-              brace, _ = find_function_body(text, anchor, path)
-              write(path, text[:brace + 1] + block + text[brace + 1:])
-              print(f"[OK] Inserted function hook in {path}: {tag}")
-
-          def insert_before(path, anchor, block, tag):
-              text = read(path)
-              if tag in text:
-                  raise RuntimeError(f"Insertion marker already exists in {path}: {tag}")
-
-              pos = text.find(anchor)
-              if pos < 0:
-                  raise RuntimeError(f"Insertion anchor not found in {path}: {anchor}")
-
-              write(path, text[:pos] + block + text[pos:])
-              print(f"[OK] Inserted declaration in {path}: {tag}")
-
-          def insert_after_struct(path, anchor, block, tag):
-              text = read(path)
-              if tag in text:
-                  raise RuntimeError(f"Struct insertion marker already exists in {path}: {tag}")
-
-              pos = text.find(anchor)
-              if pos < 0:
-                  raise RuntimeError(f"Struct anchor not found in {path}: {anchor}")
-
-              end = text.find("};", pos + len(anchor))
-              if end < 0:
-                  raise RuntimeError(f"Struct terminator not found in {path}: {anchor}")
-
-              end += 2
-              write(path, text[:end] + block + text[end:])
-              print(f"[OK] Inserted declaration after struct in {path}: {tag}")
-
-          # Ensure the selected ReSukiSU source exposes the expected hook symbols.
-          ksu_sources = list(Path("KernelSU/kernel").rglob("*"))
-          ksu_sources = [p for p in ksu_sources if p.is_file() and p.suffix in (".c", ".h")]
-
-          for symbol in ("ksu_handle_execveat", "ksu_handle_faccessat", "ksu_handle_stat"):
-              matches = []
-              pattern = re.compile(r"\b" + re.escape(symbol) + r"\s*\(")
-              for p in ksu_sources:
-                  try:
-                      if pattern.search(p.read_text(errors="ignore")):
-                          matches.append(str(p))
-                  except OSError:
-                      pass
-              if not matches:
-                  raise RuntimeError(f"Selected ReSukiSU source has no occurrence of {symbol}")
-
-          # execveat hook declaration, after user_arg_ptr.
-          insert_after_struct(
-              "fs/exec.c",
-              "struct user_arg_ptr {",
-              """
-          
-          #ifdef CONFIG_KSU_MANUAL_HOOK
-          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
-                                         void *argv, void *envp, int *flags);
-          #endif
-          """,
-              "ksu_handle_execveat declaration"
-          )
-
-          # Hook the common execution path only. Do not hook do_execve separately:
-          # it routes into the common path and would otherwise risk duplicate handling.
-          insert_function(
-              "fs/exec.c",
-              "do_execveat_common(int fd, struct filename *filename,",
-              """
-          #ifdef CONFIG_KSU_MANUAL_HOOK
-              if (ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags))
-                  return -EPERM;
-          #endif
-          """,
-              "ksu_handle_execveat(&fd"
-          )
-
-          # faccessat declaration and call.
-          insert_before(
-              "fs/open.c",
-              "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)",
-              """
-          #ifdef CONFIG_KSU_MANUAL_HOOK
-          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
-                                          int *mode, int *flags);
-          #endif
-
-          """,
-              "ksu_handle_faccessat declaration"
-          )
-
-          insert_function(
-              "fs/open.c",
-              "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)",
-              """
-          #ifdef CONFIG_KSU_MANUAL_HOOK
-              ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
-          #endif
-          """,
-              "ksu_handle_faccessat(&dfd"
-          )
-
-          # stat declaration.
-          insert_before(
-              "fs/stat.c",
-              "#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)",
-              """
-          #ifdef CONFIG_KSU_MANUAL_HOOK
-          extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
-                                     int *flags);
-          #endif
-
-          """,
-              "ksu_handle_stat declaration"
-          )
-
-          # Insert newfstatat hook if that syscall exists in this kernel revision.
-          stat_text = read("fs/stat.c")
-          newfstatat_anchor = (
-              "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,"
-          )
-          fstatat64_anchor = (
-              "SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,"
-          )
-
-          if newfstatat_anchor in stat_text:
-              insert_function(
-                  "fs/stat.c",
-                  newfstatat_anchor,
-                  """
-          #ifdef CONFIG_KSU_MANUAL_HOOK
-              ksu_handle_stat(&dfd, &filename, &flag);
-          #endif
-          """,
-                  "ksu_handle_stat(&dfd"
-              )
-          elif fstatat64_anchor in stat_text:
-              insert_function(
-                  "fs/stat.c",
-                  fstatat64_anchor,
-                  """
-          #ifdef CONFIG_KSU_MANUAL_HOOK
-              ksu_handle_stat(&dfd, &filename, &flag);
-          #endif
-          """,
-                  "ksu_handle_stat(&dfd"
-              )
-          else:
-              raise RuntimeError("Neither newfstatat nor fstatat64 syscall anchor was found")
-
-          # Old kernels may not define MODULE_IMPORT_NS. Guard the exact import line
-          # if it occurs in the KernelSU implementation.
-          ksu_c = Path("drivers/kernelsu/ksu.c")
-          if ksu_c.is_file():
-              text = ksu_c.read_text()
-              import_line = (
-                  "MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);"
-              )
-              if import_line in text and "#ifdef MODULE_IMPORT_NS" not in text:
-                  text = text.replace(
-                      import_line,
-                      "#ifdef MODULE_IMPORT_NS\n" + import_line + "\n#endif",
-                      1
-                  )
-                  ksu_c.write_text(text)
-                  print("[OK] Guarded MODULE_IMPORT_NS in drivers/kernelsu/ksu.c")
-              elif import_line not in text:
-                  print("[INFO] MODULE_IMPORT_NS line not present; no guard needed")
-              else:
-                  print("[INFO] MODULE_IMPORT_NS already appears guarded")
-          else:
-              print("[INFO] drivers/kernelsu/ksu.c not present; skipped legacy macro guard")
-
-          # Basic post-insertion audit.
-          for path, marker in (
-              ("fs/exec.c", "ksu_handle_execveat(&fd"),
-              ("fs/open.c", "ksu_handle_faccessat(&dfd"),
-              ("fs/stat.c", "ksu_handle_stat(&dfd"),
-          ):
-              count = read(path).count(marker)
-              print(f"[AUDIT] {path}: {marker} => {count}")
-              if count != 1:
-                  raise RuntimeError(f"Expected exactly one inserted call for {marker} in {path}")
-
-          print("[OK] Manual hook insertion checks completed")
+          p.write_text(s)
           PY
+          grep -q '^device.name1=polaris$' AnyKernel3/anykernel.sh
+          grep -qE '^(BLOCK|block)=auto;' AnyKernel3/anykernel.sh
+          grep -qE '^(IS_SLOT_DEVICE|is_slot_device)=auto;' AnyKernel3/anykernel.sh
+          grep -qE '^(RAMDISK_COMPRESSION|ramdisk_compression)=auto;' AnyKernel3/anykernel.sh
 
-      - name: Configure and build kernel
+      - name: Package and test ZIP
+        shell: bash
         run: |
           set -euo pipefail
-
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CC=clang-17
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export HOSTCC=gcc
-          export LLVM_IAS=1
-          export KCFLAGS="-Wno-incompatible-pointer-types -Wno-ignored-qualifiers -Wno-implicit-function-declaration -Wno-unknown-warning-option -fno-pie"
-          export USE_CCACHE=1
-
-          ccache -M 5G
-
-          mkdir -p /tmp/arm32
-          for f in /usr/bin/arm-linux-gnueabi-*; do
-            [ -e "$f" ] || continue
-            ln -sf "$f" "/tmp/arm32/$(basename "$f" | sed 's/^arm-linux-gnueabi-//')"
-          done
-          export CROSS_COMPILE_ARM32=/tmp/arm32/
-
-          cd kernel
-
-          # Avoid masking grep/sed failures, but tolerate no matching Makefiles.
-          while IFS= read -r f; do
-            [ -n "$f" ] || continue
-            sed -i \
-              's/-Werror=/-Wno-error=/g; s/-Werror-/-Wno-error=/g; s/-Werror\b/-Wno-error/g' \
-              "$f"
-          done < <(grep -rl -- '-Werror' . --include=Makefile 2>/dev/null | grep -v '^./out' || true)
-
-          mkdir -p out
-
-          make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc sdm845_defconfig
-          test -f out/.config
-
-          if [ -f arch/arm64/configs/vendor/xiaomi/mi845_defconfig ]; then
-            cat arch/arm64/configs/vendor/xiaomi/mi845_defconfig >> out/.config
-          fi
-          if [ -f arch/arm64/configs/vendor/xiaomi/polaris.config ]; then
-            cat arch/arm64/configs/vendor/xiaomi/polaris.config >> out/.config
-          fi
-
-          make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc olddefconfig
-
-          ./scripts/config --file out/.config -e KSU
-          ./scripts/config --file out/.config -e KSU_MANUAL_HOOK || true
-          ./scripts/config --file out/.config -d KSU_SUSFS || true
-          ./scripts/config --file out/.config -e KALLSYMS_ALL || true
-
-          make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc olddefconfig
-
-          echo "==== Kernel config ===="
-          grep -E '^CONFIG_(KSU|KSU_MANUAL_HOOK|KALLSYMS_ALL|KSU_SUSFS)' out/.config || true
-
-          echo "==== Build Image.gz-dtb ===="
-          set +e
-          make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc \
-            -j"$(nproc --all)" Image.gz-dtb 2>&1 | tee build.log
-          BUILD_STATUS=${PIPESTATUS[0]}
-          set -e
-
-          if [ "$BUILD_STATUS" -ne 0 ]; then
-            echo "::error::Image.gz-dtb build command failed with status $BUILD_STATUS"
-            grep -nE "error:|Error [0-9]|undefined reference|No rule to make target" build.log | tail -60 || true
-            exit "$BUILD_STATUS"
-          fi
-
-          if [ ! -f out/arch/arm64/boot/Image.gz-dtb ]; then
-            echo "::error::Build returned success but Image.gz-dtb is missing"
-            ls -lah out/arch/arm64/boot/ || true
-            exit 1
-          fi
-
-          echo "==== Build success ===="
-          ls -lh out/arch/arm64/boot/
-          strings out/arch/arm64/boot/Image.gz-dtb | grep -m1 "Linux version" || true
-
-      - name: Package AnyKernel3
-        run: |
-          set -euo pipefail
-
-          git clone https://github.com/osm0sis/AnyKernel3 --depth=1
+          cp "$GITHUB_WORKSPACE/out/arch/arm64/boot/$IMAGE_NAME" "AnyKernel3/$IMAGE_NAME"
+          mkdir -p artifacts
           cd AnyKernel3
+          rm -rf .git .github
+          zip -r9 "$GITHUB_WORKSPACE/artifacts/Polaris-ReSukiSU-AnyKernel3.zip" . -x '*.git*' -x '*.md'
+          unzip -t "$GITHUB_WORKSPACE/artifacts/Polaris-ReSukiSU-AnyKernel3.zip"
+          test -s "$GITHUB_WORKSPACE/artifacts/Polaris-ReSukiSU-AnyKernel3.zip"
 
-          rm -f Image* zImage* 2>/dev/null || true
-
-          IMAGE="../kernel/out/arch/arm64/boot/Image.gz-dtb"
-          if [ -f "$IMAGE" ]; then
-            cp "$IMAGE" ./Image.gz
-          elif [ -f ../kernel/out/arch/arm64/boot/Image.gz ]; then
-            cp ../kernel/out/arch/arm64/boot/Image.gz ./Image.gz
-          elif [ -f ../kernel/out/arch/arm64/boot/Image ]; then
-            cp ../kernel/out/arch/arm64/boot/Image ./Image
-          else
-            echo "::error::No kernel image found to package"
-            exit 1
+      - name: Save build diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p artifacts
+          {
+            echo "Kernel repository: $KERNEL_REPO"
+            echo "Kernel commit: ${KERNEL_SHA:-unknown}"
+            echo "Defconfig: $DEFCONFIG"
+            echo "Device fragment: $DEVICE_CONFIG"
+            echo "Image: $IMAGE_NAME"
+            git -C kernel log -1 --format='%H %s'
+            grep -E '^(CONFIG_KSU|CONFIG_KSU_MANUAL_HOOK|CONFIG_KALLSYMS|CONFIG_KALLSYMS_ALL)=' out/.config
+          } > artifacts/build-info.txt 2>&1
+          if [ -f build.log ]; then
+            cp build.log artifacts/build.log
+            grep -nE 'error:|fatal error:|undefined reference|No rule to make target' build.log > artifacts/build-errors.txt
           fi
 
-          grep -q '^device.name1=' anykernel.sh || {
-            echo "::error::device.name1 entry not found in anykernel.sh"
-            exit 1
-          }
-          sed -i 's/^device.name1=.*/device.name1=polaris/' anykernel.sh
-
-          grep -q '^block=' anykernel.sh || {
-            echo "::error::block entry not found in anykernel.sh"
-            exit 1
-          }
-          sed -i 's|^block=.*|block=/dev/block/bootdevice/by-name/boot;|' anykernel.sh
-
-          ZIP_NAME="../polaris-ksu-$(date +%Y%m%d).zip"
-          zip -r9 "$ZIP_NAME" . \
-            -x '.git/*' \
-            -x 'README.md' \
-            -x '.github/*'
-
-          cd ..
-          unzip -l polaris-ksu-*.zip | head -30
-
-      - name: Upload kernel ZIP
-        uses: actions/upload-artifact@v4
-        with:
-          name: polaris-ksu-zip
-          path: polaris-ksu-*.zip
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload build log
+      - name: Upload artifacts and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
-          path: kernel/build.log
-          if-no-files-found: ignore
-          retention-days: 30
+          name: Polaris-ReSukiSU-build-artifacts
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
