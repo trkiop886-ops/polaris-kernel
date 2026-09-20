@@ -1,0 +1,273 @@
+name: Polaris ReSukiSU Kernel Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/polaris.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: polaris-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      KERNEL_REPO: https://github.com/LineageOS/android_kernel_xiaomi_sdm845.git
+      KERNEL_BRANCH: lineage-21
+      KERNEL_COMMIT: 88606771eef343b0a2158de455a9537fba17b2f2
+      DEFCONFIG: vendor/xiaomi/mi845_defconfig
+      DEVICE_CONFIG: vendor/xiaomi/polaris.config
+      IMAGE_NAME: Image.gz-dtb
+      ANYKERNEL_REPO: https://github.com/osm0sis/AnyKernel3.git
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex git \
+            libelf-dev libssl-dev lld-14 llvm-14 clang-14 gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi device-tree-compiler python3 zip unzip rsync \
+            dwarves file
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: polaris-clang-${{ runner.os }}-${{ env.KERNEL_COMMIT }}-${{ hashFiles('.github/workflows/polaris.yml') }}
+          restore-keys: |
+            polaris-clang-${{ runner.os }}-${{ env.KERNEL_COMMIT }}-
+
+      - name: Fetch pinned kernel source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init kernel
+          cd kernel
+          git remote add origin "$KERNEL_REPO"
+          git fetch --no-tags --depth=1 origin "$KERNEL_COMMIT"
+          git checkout --detach FETCH_HEAD
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$KERNEL_COMMIT" || {
+            echo "::error::Kernel SHA mismatch: $actual"; exit 1; }
+          echo "KERNEL_SHA=$actual" >> "$GITHUB_ENV"
+          test -f "arch/arm64/configs/$DEFCONFIG"
+          test -f "arch/arm64/configs/$DEVICE_CONFIG"
+          git log -1 --format='%H %s'
+
+      - name: Install ReSukiSU
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd kernel
+          curl -fL --retry 4 --retry-delay 3 \
+            https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh \
+            -o /tmp/resukisu-setup.sh
+          bash /tmp/resukisu-setup.sh
+          if [ ! -d KernelSU ] && [ ! -d drivers/kernelsu ]; then
+            echo "::error::ReSukiSU installer did not create a recognized KernelSU source directory."
+            exit 1
+          fi
+          find . -maxdepth 4 -iname '*kernelsu*' -o -iname '*ksu*' | head -80
+
+      - name: Automatically integrate legacy ReSukiSU hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd kernel
+          # This project publishes a hook script intended for legacy non-GKI kernels.
+          # Fetch the repository and discover the script instead of requiring a user patch.
+          git clone --depth=1 https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd.git /tmp/non-gki-tools
+          hook_script="$(find /tmp/non-gki-tools -type f -name syscall_hook_patches.sh -print -quit)"
+          test -n "$hook_script" || { echo '::error::Upstream syscall_hook_patches.sh not found'; exit 1; }
+          bash "$hook_script"
+          git diff --check
+          # Reject partial integrations: each mandatory syscall hook must appear in
+          # the expected translation unit after the upstream patch script completes.
+          declare -A required_hooks=(
+            [fs/stat.c]=ksu_handle_stat
+            [fs/open.c]=ksu_handle_faccessat
+            [fs/exec.c]=ksu_handle_execveat
+            [kernel/reboot.c]=ksu_handle_sys_reboot
+            [fs/read_write.c]=ksu_handle_sys_read
+            [kernel/sys.c]=ksu_handle_setresuid
+          )
+          for source in "${!required_hooks[@]}"; do
+            if ! grep -q "${required_hooks[$source]}" "$source"; then
+              echo "::error::Required hook missing after auto integration: $source (${required_hooks[$source]})"
+              exit 1
+            fi
+          done
+          for handler in ksu_handle_post_execveat ksu_handle_newfstat_ret; do
+            if ! grep -Rqs "$handler" fs kernel --include='*.c' --include='*.h'; then
+              echo "::error::Required ReSukiSU handler symbol missing: $handler"
+              exit 1
+            fi
+          done
+          if find . -type f -name '*.rej' -print -quit | grep -q .; then
+            echo '::error::Hook integration left reject files'; exit 1
+          fi
+          git status --short
+
+      - name: Configure kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd kernel
+          export ARCH SUBARCH
+          export PATH="/usr/lib/llvm-14/bin:$PATH"
+          export CC="ccache clang-14"
+          export LD=ld.lld-14 AR=llvm-ar-14 NM=llvm-nm-14
+          export OBJCOPY=llvm-objcopy-14 OBJDUMP=llvm-objdump-14 STRIP=llvm-strip-14
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          ccache -M 5G
+          make O="$GITHUB_WORKSPACE/out" "$DEFCONFIG"
+          cat "arch/arm64/configs/$DEVICE_CONFIG" >> "$GITHUB_WORKSPACE/out/.config"
+          scripts/config --file "$GITHUB_WORKSPACE/out/.config" \
+            -e KSU -e KSU_MANUAL_HOOK -e KALLSYMS -e KALLSYMS_ALL
+          make O="$GITHUB_WORKSPACE/out" olddefconfig
+          cfg="$GITHUB_WORKSPACE/out/.config"
+          for opt in CONFIG_KSU CONFIG_KSU_MANUAL_HOOK CONFIG_KALLSYMS CONFIG_KALLSYMS_ALL; do
+            grep -qx "$opt=y" "$cfg" || {
+              echo "::error::$opt was not enabled by Kconfig"; exit 1; }
+          done
+          grep -E '^(CONFIG_KSU|CONFIG_KSU_MANUAL_HOOK|CONFIG_KALLSYMS|CONFIG_KALLSYMS_ALL)=' "$cfg"
+
+      - name: Relax legacy Werror flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd kernel
+          while IFS= read -r -d '' f; do
+            sed -i -E \
+              -e 's/-Werror=/-Wno-error=/g' \
+              -e 's/-Werror-/-Wno-error-/g' \
+              -e 's/-Werror([[:space:]]|$)/-Wno-error\1/g' "$f"
+          done < <(find . -type f -name Makefile -not -path './.git/*' -print0)
+
+      - name: Build Image.gz-dtb
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd kernel
+          export ARCH SUBARCH
+          export PATH="/usr/lib/llvm-14/bin:$PATH"
+          export CC="ccache clang-14"
+          export LD=ld.lld-14 AR=llvm-ar-14 NM=llvm-nm-14
+          export OBJCOPY=llvm-objcopy-14 OBJDUMP=llvm-objdump-14 STRIP=llvm-strip-14
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          export KBUILD_BUILD_USER=github-actions
+          export KBUILD_BUILD_HOST=polaris
+          set -o pipefail
+          make -j"$(nproc)" O="$GITHUB_WORKSPACE/out" Image.gz-dtb 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Verify kernel image
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="$GITHUB_WORKSPACE/out/arch/arm64/boot/$IMAGE_NAME"
+          test -s "$IMAGE" || { echo "::error::Kernel image missing"; exit 1; }
+          file "$IMAGE"
+          ls -lh "$IMAGE"
+
+      - name: Automatically prepare AnyKernel3 for Polaris
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          test -s AnyKernel3/anykernel.sh
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path("AnyKernel3/anykernel.sh")
+          s = p.read_text(errors="strict")
+
+          # AnyKernel3 device identifiers belong in its properties() string.
+          prop = re.search(r"(?ms)(properties\(\)\s*\{\s*')(.*?)(\n'\s*;\s*\})", s)
+          if not prop:
+              raise SystemExit("Unrecognized AnyKernel3 properties() block; refusing unsafe edit")
+          body = prop.group(2)
+          if not re.search(r"(?m)^device\.name[0-9]*=", body):
+              raise SystemExit("No device.name property in AnyKernel3 properties block")
+          body, count = re.subn(r"(?m)^device\.name[0-9]*=.*$", "", body)
+          body = body.rstrip() + "\ndevice.name1=polaris"
+          s = s[:prop.start(2)] + body + s[prop.end(2):]
+
+          # Support both legacy lowercase and current uppercase AK3 shell variables.
+          for key, value in (("BLOCK", "auto"), ("IS_SLOT_DEVICE", "auto"),
+                             ("RAMDISK_COMPRESSION", "auto")):
+              variants = (key, key.lower())
+              found = False
+              for name in variants:
+                  pattern = rf"(?m)^{name}=[^;]*;"
+                  if re.search(pattern, s):
+                      s, n = re.subn(pattern, f"{name}={value};", s, count=1)
+                      found = n == 1
+                      break
+              if not found:
+                  raise SystemExit(f"AnyKernel3 variable {key} not found; refusing to append a potentially ineffective setting")
+
+          p.write_text(s)
+          PY
+          grep -q '^device.name1=polaris$' AnyKernel3/anykernel.sh
+          grep -qE '^(BLOCK|block)=auto;' AnyKernel3/anykernel.sh
+          grep -qE '^(IS_SLOT_DEVICE|is_slot_device)=auto;' AnyKernel3/anykernel.sh
+          grep -qE '^(RAMDISK_COMPRESSION|ramdisk_compression)=auto;' AnyKernel3/anykernel.sh
+
+      - name: Package and test ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$GITHUB_WORKSPACE/out/arch/arm64/boot/$IMAGE_NAME" "AnyKernel3/$IMAGE_NAME"
+          mkdir -p artifacts
+          cd AnyKernel3
+          rm -rf .git .github
+          zip -r9 "$GITHUB_WORKSPACE/artifacts/Polaris-ReSukiSU-AnyKernel3.zip" . -x '*.git*' -x '*.md'
+          unzip -t "$GITHUB_WORKSPACE/artifacts/Polaris-ReSukiSU-AnyKernel3.zip"
+          test -s "$GITHUB_WORKSPACE/artifacts/Polaris-ReSukiSU-AnyKernel3.zip"
+
+      - name: Save build diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p artifacts
+          {
+            echo "Kernel repository: $KERNEL_REPO"
+            echo "Kernel commit: ${KERNEL_SHA:-unknown}"
+            echo "Defconfig: $DEFCONFIG"
+            echo "Device fragment: $DEVICE_CONFIG"
+            echo "Image: $IMAGE_NAME"
+            git -C kernel log -1 --format='%H %s'
+            grep -E '^(CONFIG_KSU|CONFIG_KSU_MANUAL_HOOK|CONFIG_KALLSYMS|CONFIG_KALLSYMS_ALL)=' out/.config
+          } > artifacts/build-info.txt 2>&1
+          if [ -f build.log ]; then
+            cp build.log artifacts/build.log
+            grep -nE 'error:|fatal error:|undefined reference|No rule to make target' build.log > artifacts/build-errors.txt
+          fi
+
+      - name: Upload artifacts and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Polaris-ReSukiSU-build-artifacts
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
