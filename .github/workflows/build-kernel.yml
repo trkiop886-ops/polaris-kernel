@@ -1,4 +1,4 @@
-name: Build Polaris Kernel (lineage-21 + clang17 + SukiSU)
+name: Build Polaris Kernel (lineage-21 + clang17 + SukiSU + SUSFS)
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ jobs:
           sudo apt update
           sudo apt install -y clang-17 llvm-17 make bison flex bc libssl-dev libelf-dev \
             zip unzip ccache binutils binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu gcc-arm-linux-gnueabi
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu gcc-arm-linux-gnueabi patch
           clang-17 --version | head -2
 
       - name: clone-kernel
@@ -31,22 +31,9 @@ jobs:
           echo "== repo root =="
           ls -la
           Z=$(ls *.zip 2>/dev/null | head -1)
-          if [ -z "$Z" ]; then
-            echo "!! no zip in repo root"
-            exit 1
-          fi
+          if [ -z "$Z" ]; then echo "!! no zip in repo root"; exit 1; fi
           echo "== using: $Z =="
           [ "$Z" = "ksu_src.zip" ] || cp -f "$Z" ksu_src.zip
-          python3 - <<'PY'
-          import zipfile, sys
-          try:
-              z = zipfile.ZipFile('ksu_src.zip')
-              print('zip ok, entries:', len(z.namelist()))
-              assert any(n.startswith('ksu/kernel/') for n in z.namelist()), 'no ksu/kernel/'
-          except Exception as e:
-              print('bad zip:', e)
-              sys.exit(1)
-          PY
           unzip -q ksu_src.zip -d src
           ls src | head -5
           cd kernel
@@ -68,6 +55,41 @@ jobs:
           PY
           ls drivers/kernelsu | head -3
 
+      - name: apply-susfs
+        run: |
+          cd kernel
+          echo "== 下载 susfs4ksu (kernel-4.9 分支) =="
+          curl -fL --retry 3 --max-time 300 -o /tmp/susfs.tar.gz \
+            "https://gitlab.com/simonpunk/susfs4ksu/-/archive/kernel-4.9/susfs4ksu-kernel-4.9.tar.gz"
+          tar -xzf /tmp/susfs.tar.gz -C /tmp
+          S=/tmp/susfs4ksu-kernel-4.9/kernel_patches
+          ls $S
+          cp -f $S/fs/susfs.c fs/
+          cp -f $S/include/linux/susfs.h $S/include/linux/susfs_def.h $S/include/linux/sus_su.h include/linux/ 2>/dev/null || true
+          echo "== 打内核补丁(允许部分失败, 下面手工补) =="
+          patch -p1 --forward --no-backup-if-mismatch < $S/50_add_susfs_in_kernel-4.9.patch || true
+          echo "== 手工补那两处(LineageOS 版本差异) =="
+          python3 - <<'PY'
+          def rd(p): return open(p).read()
+          def wr(p, s): open(p, 'w').write(s)
+          p = 'fs/proc/task_mmu.c'; s = rd(p); a = '#include <linux/mm_inline.h>\n'
+          if 'susfs_def.h' not in s and a in s:
+              wr(p, s.replace(a, a + '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n', 1)); print('[fix] task_mmu.c')
+          p = 'fs/proc/cmdline.c'; s = rd(p); a = '#include <linux/seq_file.h>\n'
+          if 'susfs_spoof_cmdline_or_bootconfig' not in s and a in s:
+              s = s.replace(a, a + '\n#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\nextern int susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);\n#endif\n', 1)
+              c = '{\n#ifdef CONFIG_INITRAMFS_IGNORE_SKIP_FLAG\n\tseq_printf(m, "%s\\n", proc_command_line);'
+              d = '{\n#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n\tif (!susfs_spoof_cmdline_or_bootconfig(m)) {\n\t\tseq_putc(m, \'\\n\');\n\t\treturn 0;\n\t}\n#endif\n#ifdef CONFIG_INITRAMFS_IGNORE_SKIP_FLAG\n\tseq_printf(m, "%s\\n", proc_command_line);'
+              if c in s:
+                  s = s.replace(c, d, 1)
+              wr(p, s); print('[fix] cmdline.c')
+          PY
+          find . -name "*.rej" -delete 2>/dev/null || true
+          echo "== 落地检查(应看到 61 / 4 / 1) =="
+          grep -c susfs fs/namespace.c
+          grep -c susfs fs/stat.c
+          grep -c susfs kernel/kallsyms.c
+
       - name: patch-manual-hooks
         run: |
           cd kernel
@@ -79,38 +101,20 @@ jobs:
               if i < 0:
                   print('  [MISS]', path); return
               write(path, s[:i+len(anchor)] + block + s[i+len(anchor):]); print('  [OK] after', path)
-          def ins_inside(path, anchor, block, tag=None):
-              s = read(path)
-              if tag and tag in s:
-                  print('  [skip]', path); return
-              i = s.find(anchor)
+          def ins_inside(path, anchor, block):
+              s = read(path); i = s.find(anchor)
               if i < 0:
                   print('  [MISS]', path); return
               j = s.find('{', i)
               if j < 0:
                   print('  [MISS brace]', path); return
               write(path, s[:j+1] + block + s[j+1:]); print('  [OK] inside', path)
-          def ins_before(path, anchor, block):
-              s = read(path)
-              if block.strip() in s:
-                  print('  [skip]', path); return
-              i = s.find(anchor)
-              if i < 0:
-                  print('  [MISS]', path); return
-              write(path, s[:i] + block + s[i:]); print('  [OK] before', path)
           ins_after('fs/exec.c', '#include <linux/binfmts.h>', '\n#ifdef CONFIG_KSU\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n#endif\n')
           ins_inside('fs/exec.c', 'do_execveat_common(int fd, struct filename *filename,', '\n#ifdef CONFIG_KSU\n\tif (ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags))\n\t\treturn -EPERM;\n#endif')
-          ins_before('fs/open.c', 'SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)', '\n#ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,\n\t\t\t\tint *__unused_flags);\n#endif\n')
-          ins_inside('fs/open.c', 'SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)', '\n#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif')
-          ins_before('fs/stat.c', '#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)', '\n#ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n#endif\n')
-          ins_inside('fs/stat.c', 'SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,', '\n#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif', tag='ksu_handle_stat(&dfd')
-          ins_inside('fs/stat.c', 'SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,', '\n#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif')
           print('hooks applied')
           PY
-          echo "== hooks check (期望 2 / 2 / 3) =="
+          echo "== execve 钩子数(期望 2) =="
           grep -c ksu_handle_execveat fs/exec.c
-          grep -c ksu_handle_faccessat fs/open.c
-          grep -c ksu_handle_stat fs/stat.c
 
       - name: write-config
         run: |
@@ -118,11 +122,11 @@ jobs:
           cp ../src/utopia.config .config
           ./scripts/config --file .config \
             -d DEBUG_INFO -d DEBUG_INFO_REDUCED -d DEBUG_INFO_SPLIT -d CC_WERROR \
-            -e KSU -d KSU_SUSFS -d KSU_SUSFS_SUS_PATH -d KSU_SUSFS_SUS_MOUNT \
+            -e KSU -e KSU_SUSFS -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT \
             --set-str LOCALVERSION "-perf-g88606771eef3" -d LOCALVERSION_AUTO
           make ARCH=arm64 olddefconfig >/dev/null
           echo "== config check =="
-          grep -E '^CONFIG_KSU|^CONFIG_LOCALVERSION=|^CONFIG_BUILD_ARM64_APPENDED_DTB|^CONFIG_KALLSYMS_ALL' .config || true
+          grep -E '^CONFIG_KSU|^CONFIG_THREAD_INFO_IN_TASK|^CONFIG_BUILD_ARM64_APPENDED' .config || true
 
       - name: build-kernel
         run: |
@@ -146,21 +150,16 @@ jobs:
             make ARCH=arm64 olddefconfig >/dev/null
             make -j$(nproc --all) Image.gz-dtb 2>&1 | tee -a build.log
           fi
-          if [ ! -f arch/arm64/boot/Image.gz-dtb ]; then
-            echo "==== round3: Image ===="
-            make -j$(nproc --all) Image 2>&1 | tee -a build.log
-            gzip -9c arch/arm64/boot/Image > arch/arm64/boot/Image.gz 2>/dev/null
-          fi
           if [ ! -f arch/arm64/boot/Image.gz-dtb ] && [ ! -f arch/arm64/boot/Image.gz ]; then
             echo "======== FAILED ========"
-            grep -nE "error:|Error [0-9]" build.log | tail -30
+            grep -nE "error:|fatal error" build.log | tail -30
             echo "---------------- tail -20 ----------------"
             tail -20 build.log
             exit 1
           fi
           echo "==== OK ===="
           ls -lh arch/arm64/boot/ | head -6
-          strings arch/arm64/boot/Image.gz-dtb arch/arm64/boot/Image 2>/dev/null | grep -m1 "Linux version" || true
+          strings arch/arm64/boot/Image 2>/dev/null | grep -m1 "Linux version" || true
 
       - name: package-anykernel3
         run: |
@@ -174,17 +173,16 @@ jobs:
           else
             cp ../kernel/arch/arm64/boot/Image ./Image
           fi
-          ls -l Image*
           sed -i 's/device.name1=.*/device.name1=polaris/' anykernel.sh
           sed -i 's|block=.*|block=/dev/block/bootdevice/by-name/boot;|' anykernel.sh
-          zip -r9 ../polaris-ksu-$(date +%Y%m%d).zip *
+          zip -r9 ../polaris-ksu-susfs-$(date +%Y%m%d).zip *
           cd ..
-          unzip -l polaris-ksu-*.zip | head -20
+          unzip -l polaris-ksu-susfs-*.zip | head -20
 
       - uses: actions/upload-artifact@v4
         with:
-          name: polaris-ksu-zip
-          path: polaris-ksu-*.zip
+          name: polaris-ksu-susfs-zip
+          path: polaris-ksu-susfs-*.zip
           retention-days: 30
 
       - uses: actions/upload-artifact@v4
