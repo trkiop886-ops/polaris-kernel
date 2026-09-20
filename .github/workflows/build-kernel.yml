@@ -28,8 +28,19 @@ jobs:
 
       - name: 集成你的 SukiSU(照 build_all.sh)
         run: |
+          KSU_URL="https://tmpfiles.org/dl/w2wQxxJifFDm/ksu_src.zip"
+          echo "== 下载 KSU 源码包 =="
+          curl -fL --retry 3 --max-time 300 -o ksu_src.zip "$KSU_URL" || true
+          if [ ! -s ksu_src.zip ]; then
+            Z=$(ls *.zip 2>/dev/null | head -1)
+            [ -n "$Z" ] && cp "$Z" ksu_src.zip
+          fi
+          if [ ! -s ksu_src.zip ]; then
+            echo "!! 没拿到源码包(链接可能过期 → 喊我重发)"; ls -la; exit 1
+          fi
           ls -l ksu_src.zip
           unzip -q ksu_src.zip -d src
+          ls src | head -5
           cd kernel
           rm -rf KernelSU drivers/kernelsu
           mkdir -p KernelSU
@@ -56,7 +67,8 @@ jobs:
             -e KSU -d KSU_SUSFS -d KSU_SUSFS_SUS_PATH -d KSU_SUSFS_SUS_MOUNT \
             --set-str LOCALVERSION "-perf-g88606771eef3" -d LOCALVERSION_AUTO
           make ARCH=arm64 olddefconfig >/dev/null
-          grep -E '^CONFIG_KSU|^CONFIG_LOCALVERSION=' .config || true
+          echo "== 配置检查 =="
+          grep -E '^CONFIG_KSU|^CONFIG_LOCALVERSION=|^CONFIG_BUILD_ARM64_APPENDED_DTB' .config || true
 
       - name: 编译(clang-17, 失败自动打印真错误)
         run: |
@@ -72,20 +84,27 @@ jobs:
           cd kernel
           grep -rl -- '-Werror' . --include=Makefile 2>/dev/null | grep -v '^./out' | while read f; do \
             sed -i 's/-Werror=/-Wno-error=/g; s/-Werror-/-Wno-error=/g; s/-Werror\b/-Wno-error/g' "$f"; done
+          echo "==== 第1轮: Image.gz-dtb ===="
           make -j$(nproc --all) Image.gz-dtb 2>&1 | tee build.log
           if [ ! -f arch/arm64/boot/Image.gz-dtb ]; then
-            ./scripts/config --file .config -d COMPAT_VDSO; make ARCH=arm64 olddefconfig >/dev/null
+            echo "==== 第2轮: 关掉 COMPAT_VDSO 重编 ===="
+            ./scripts/config --file .config -d COMPAT_VDSO
+            make ARCH=arm64 olddefconfig >/dev/null
             make -j$(nproc --all) Image.gz-dtb 2>&1 | tee -a build.log
           fi
           if [ ! -f arch/arm64/boot/Image.gz-dtb ]; then
+            echo "==== 第3轮: 退到 Image ===="
             make -j$(nproc --all) Image 2>&1 | tee -a build.log
             gzip -9c arch/arm64/boot/Image > arch/arm64/boot/Image.gz 2>/dev/null
           fi
           if [ ! -f arch/arm64/boot/Image.gz-dtb ] && [ ! -f arch/arm64/boot/Image.gz ]; then
-            echo "======== 失败,真错误 ========"; grep -nE "error:|Error [0-9]" build.log | tail -30; tail -20 build.log; exit 1
+            echo "======== 失败, 真错误如下 ========"
+            grep -nE "error:|Error [0-9]" build.log | tail -30
+            echo "---------------- tail -20 ----------------"; tail -20 build.log
+            exit 1
           fi
-          echo "==== 成功 ===="; ls -lh arch/arm64/boot/ | head
-          grep -a -o 'Linux version[^"]*' arch/arm64/boot/Image.gz-dtb arch/arm64/boot/Image 2>/dev/null | head -1
+          echo "==== 成功 ===="; ls -lh arch/arm64/boot/ | head -6
+          strings arch/arm64/boot/Image.gz-dtb arch/arm64/boot/Image 2>/dev/null | grep -m1 "Linux version" || true
 
       - name: 打包 AnyKernel3(TWRP 卡刷包)
         run: |
