@@ -1,4 +1,4 @@
-name: Build Polaris Kernel (lineage-21 + clang17 + ReSukiSU 满血root)
+name: Build Polaris Kernel (lineage-21 + clang17 + ReSukiSU manual-hook)
 
 on:
   workflow_dispatch:
@@ -11,87 +11,98 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装完整编译工具链
+      - name: 安装编译工具链
         run: |
           sudo apt update
           sudo apt install -y clang-17 llvm-17 make bison flex bc libssl-dev libelf-dev \
             zip unzip ccache binutils binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi patch
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu gcc-arm-linux-gnueabi patch python3
           clang-17 --version | head -2
-          aarch64-linux-gnu-gcc --version | head -1
-          arm-linux-gnueabi-as --version | head -1
 
-      - name: 拉取 lineage-21 内核源码
+      - name: 拉源码（lineage-21，钉到 2024-12）
         run: |
           git clone https://github.com/LineageOS/android_kernel_xiaomi_sdm845 kernel -b lineage-21 --depth=400
           cd kernel
           git checkout $(git rev-list -n 1 --before="2025-01-01 00:00" lineage-21) || true
           git log -1 --format="%h %cd %s" --date=short
 
-      - name: 集成 ReSukiSU 核心
+      - name: 集成 ReSukiSU + 自动挑带手动钩子定义的旧版本
         run: |
           cd kernel
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+          cd KernelSU
+          git fetch --unshallow --tags 2>/dev/null || true
+          PICK=""
+          for T in v3.2.0 v3.1.9 v3.1.8 v3.1.7; do
+            git checkout -f "$T" >/dev/null 2>&1 || continue
+            D=$(grep -rn "int ksu_handle_execveat(" kernel --include="*.c" 2>/dev/null | wc -l)
+            F=$(grep -rn "int ksu_handle_faccessat(" kernel --include="*.c" 2>/dev/null | wc -l)
+            S=$(grep -rn "int ksu_handle_stat(" kernel --include="*.c" 2>/dev/null | wc -l)
+            echo "== $T : execveat定义=$D  faccessat定义=$F  stat定义=$S"
+            if [ "$D" -ge 1 ] && [ "$F" -ge 1 ] && [ "$S" -ge 1 ]; then PICK="$T"; break; fi
+          done
+          if [ -n "$PICK" ]; then git checkout -f "$PICK"; echo ">>> 选定 $PICK"; else echo ">>> 没有带定义的老版本(日志里能看到),继续用当前"; fi
+          git describe --tags 2>/dev/null || true
 
-      - name: 打全量手动hook（execve/faccessat/stat/reboot，官方diff版）
+      - name: 打手动钩子（execve×2 + faccessat + stat）
         run: |
           cd kernel
           python3 - <<'PY'
           def read(p): return open(p).read()
           def write(p,s): open(p,'w').write(s)
-          def ins_before(path, anchor, block):
-              s=read(path)
-              if block.strip() in s: print('  [skip] 已有:',path); return
-              i=s.find(anchor)
-              if i<0: print('  [MISS]',path,anchor[:50]); return
-              write(path, s[:i]+block+s[i:]); print('  [OK] 前插:',path,anchor[:45])
           def ins_after(path, anchor, block, start=0):
               s=read(path); i=s.find(anchor,start)
-              if i<0: print('  [MISS]',path,anchor[:50]); return
-              j=i+len(anchor); write(path, s[:j]+block+s[j:]); print('  [OK] 后插:',path,anchor[:45])
+              if i<0: print('  [MISS]',path,anchor[:40]); return
+              write(path, s[:i+len(anchor)]+block+s[i+len(anchor)]); print('  [OK] 后插',path)
           def ins_inside(path, anchor, block, tag=None):
               s=read(path)
-              if tag and tag in s: print('  [skip] 已有:',path,tag); return
+              if tag and tag in s: print('  [skip]',path); return
               i=s.find(anchor)
-              if i<0: print('  [MISS]',path,anchor[:50]); return
+              if i<0: print('  [MISS]',path,anchor[:40]); return
               j=s.find('{',i)
               if j<0: print('  [MISS brace]',path); return
-              write(path, s[:j+1]+block+s[j+1:]); print('  [OK] 函数内:',path,anchor[:45])
-          def ins_after_in_func(path, func, anchor, block):
-              s=read(path); i=s.find(func)
-              if i<0: print('  [MISS func]',path,func[:40]); return
-              ins_after(path, anchor, block, i)
+              write(path, s[:j+1]+block+s[j+1:]); print('  [OK] 函数内',path)
+          def ins_before(path, anchor, block):
+              s=read(path)
+              if block.strip() in s: print('  [skip]',path); return
+              i=s.find(anchor)
+              if i<0: print('  [MISS]',path,anchor[:40]); return
+              write(path, s[:i]+block+s[i:]); print('  [OK] 前插',path)
+          def ins_after_struct(path, anchor, block, fallback=None):
+              s=read(path); i=s.find(anchor)
+              if i<0:
+                  if fallback: return ins_after(path, fallback, block)
+                  print('  [MISS]',path); return
+              j=s.find('};', i); write(path, s[:j+2]+block+s[j+2:]); print('  [OK] 结构体后',path)
 
-          # 1) execve
-          ins_after('fs/exec.c','#include <linux/binfmts.h>','\n#ifdef CONFIG_KSU_MANUAL_HOOK\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n\t\t\t\tstruct user_arg_ptr argv, struct user_arg_ptr envp, int *flags);\n#endif\n')
-          ins_inside('fs/exec.c','do_execveat_common(int fd, struct filename *filename,','\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tif (ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags))\n\t\treturn -EPERM;\n#endif')
-          ins_inside('fs/exec.c','int do_execve(struct filename *filename,','\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tstruct user_arg_ptr ksu_argv = { .ptr.native = __argv };\n\tstruct user_arg_ptr ksu_envp = { .ptr.native = __envp };\n\tint ksu_flags = 0;\n\tif (ksu_handle_execveat(&(int){AT_FDCWD}, &filename, ksu_argv, ksu_envp, &ksu_flags))\n\t\treturn -EPERM;\n#endif')
-          # 2) faccessat
-          ins_before('fs/open.c','SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)','\n#ifdef CONFIG_KSU_MANUAL_HOOK\n__attribute__((hot))\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n\t\t\t\tint *mode, int *flags);\n#endif\n')
-          ins_inside('fs/open.c','SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)','\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif')
-          # 3) stat
-          ins_before('fs/stat.c','#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)','\n#ifdef CONFIG_KSU_MANUAL_HOOK\n__attribute__((hot))\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n\t\t\t\tint *flags);\nextern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);\n#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)\nextern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);\n#endif\n#endif\n')
-          ins_inside('fs/stat.c','SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,','\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif', tag='ksu_handle_stat(&dfd')
-          ins_inside('fs/stat.c','SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,','\n#ifdef CONFIG_KSU_MANUAL_HOOK /* fstatat64 */\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif')
-          ins_after_in_func('fs/stat.c','SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)','cp_new_stat(&stat, statbuf);','\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif')
-          ins_after_in_func('fs/stat.c','SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)','cp_new_stat64(&stat, statbuf);','\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif')
-          # 4) reboot
-          ins_before('kernel/reboot.c','SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,','\n#ifdef CONFIG_KSU_MANUAL_HOOK\nextern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n#endif\n')
-          ins_inside('kernel/reboot.c','SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,','\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif')
+          ins_after_struct('fs/exec.c','struct user_arg_ptr {',
+            '\n#ifdef CONFIG_KSU_MANUAL_HOOK\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n\t\t\t\tvoid *argv, void *envp, int *flags);\n#endif\n',
+            fallback='#include <linux/binfmts.h>')
+          ins_inside('fs/exec.c','do_execveat_common(int fd, struct filename *filename,',
+            '\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tif (ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags))\n\t\treturn -EPERM;\n#endif')
+          ins_inside('fs/exec.c','int do_execve(struct filename *filename,',
+            '\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tstruct user_arg_ptr ksu_argv = { .ptr.native = __argv };\n\tstruct user_arg_ptr ksu_envp = { .ptr.native = __envp };\n\tint ksu_flags = 0;\n\tif (ksu_handle_execveat(&(int){AT_FDCWD}, &filename, &ksu_argv, &ksu_envp, &ksu_flags))\n\t\treturn -EPERM;\n#endif')
+          ins_before('fs/open.c','SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)',
+            '\n#ifdef CONFIG_KSU_MANUAL_HOOK\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n\t\t\t\tint *mode, int *flags);\n#endif\n')
+          ins_inside('fs/open.c','SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)',
+            '\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif')
+          ins_before('fs/stat.c','#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)',
+            '\n#ifdef CONFIG_KSU_MANUAL_HOOK\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n\t\t\t\tint *flags);\n#endif\n')
+          ins_inside('fs/stat.c','SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,',
+            '\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif', tag='ksu_handle_stat(&dfd')
+          ins_inside('fs/stat.c','SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,',
+            '\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif')
 
-          # 5) 保险丝:把守卫的 error 降级成 warning(万一某个锚点没中, 也不至于整停)
-          import glob
-          for p in glob.glob('KernelSU/kernel/tools/manual_hook_check.mk') + glob.glob('**/manual_hook_check.mk', recursive=True):
-              try:
-                  s=open(p).read(); n=s.count('$(error ')
-                  if n:
-                      open(p,'w').write(s.replace('$(error ','$(warning ')); print('  [OK] 守卫 error->warning x%d: %s'%(n,p))
-              except Exception as e: print('  [skip]',p,e)
-
-          print('=== 钩子验证 ===')
-          for p,ks in [('fs/exec.c',['ksu_handle_execveat']),('fs/open.c',['ksu_handle_faccessat']),('fs/stat.c',['ksu_handle_stat','ksu_handle_newfstat_ret','ksu_handle_fstat64_ret']),('kernel/reboot.c',['ksu_handle_sys_reboot'])]:
-              s=read(p); print(' ', p, {k:s.count(k) for k in ks})
+          print('=== 钩子统计 ===')
+          import sys
+          _bad = False
+          for p,k in [('fs/exec.c','ksu_handle_execveat'),
+                      ('fs/open.c','ksu_handle_faccessat'),
+                      ('fs/stat.c','ksu_handle_stat')]:
+              _c = read(p).count(k)
+              print(' ', p, _c)
+              if _c < 2: _bad = True
+          sys.exit('!! 钩子没插全, 中止' if _bad else 0)
           PY
 
       - name: 内核配置 + 编译
@@ -103,15 +114,14 @@ jobs:
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export HOSTCC=gcc
           export LLVM_IAS=1
-          export KCFLAGS="-Wno-incompatible-pointer-types -Wno-ignored-qualifiers -Wno-implicit-function-declaration -Wno-error -fno-pie"
-          export USE_CCACHE=1
-          ccache -M 5G
+          export KCFLAGS="-Wno-incompatible-pointer-types -Wno-ignored-qualifiers -Wno-implicit-function-declaration -Wno-unknown-warning-option -fno-pie"
+          export USE_CCACHE=1; ccache -M 5G
           mkdir -p /tmp/arm32
           for f in /usr/bin/arm-linux-gnueabi-*; do ln -sf "$f" "/tmp/arm32/$(basename "$f" | sed 's/^arm-linux-gnueabi-//')"; done
-          ls -l /tmp/arm32/ld /tmp/arm32/as || true
           export CROSS_COMPILE_ARM32=/tmp/arm32/
           cd kernel
-          grep -rl -- '-Werror' . --include=Makefile 2>/dev/null | grep -v '^./out' | while read f; do sed -i 's/-Werror=/-Wno-error=/g; s/-Werror/-Wno-error/g' "$f"; done
+          grep -rl -- '-Werror' . --include=Makefile 2>/dev/null | grep -v '^./out' | while read f; do \
+            sed -i 's/-Werror=/-Wno-error=/g; s/-Werror-/-Wno-error=/g; s/-Werror\b/-Wno-error/g' "$f"; done
           mkdir -p out
           make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc sdm845_defconfig
           [ -f out/.config ] || { echo "!! defconfig 失败"; exit 1; }
@@ -121,27 +131,21 @@ jobs:
           ./scripts/config --file out/.config -e KSU
           ./scripts/config --file out/.config -e KSU_MANUAL_HOOK || true
           ./scripts/config --file out/.config -d KSU_SUSFS || true
-          ./scripts/config --file out/.config -e KALLSYMS_ALL
+          ./scripts/config --file out/.config -e KALLSYMS_ALL || true
           make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc olddefconfig
           grep -E '^CONFIG_KSU|^CONFIG_KALLSYMS_ALL' out/.config || true
-          echo "==== 编译 第1轮 ===="
+          echo "==== 编译 ===="
           make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc -j$(nproc --all) Image.gz-dtb 2>&1 | tee build.log
           if [ ! -f out/arch/arm64/boot/Image.gz-dtb ]; then
-            echo "==== 试默认目标 ===="
             make O=out ARCH=arm64 CC=clang-17 HOSTCC=gcc -j$(nproc --all) 2>&1 | tee -a build.log
           fi
           if [ ! -f out/arch/arm64/boot/Image.gz-dtb ] && [ ! -f out/arch/arm64/boot/Image.gz ] && [ ! -f out/arch/arm64/boot/Image ]; then
-            echo "======== 编译失败, 真错误(抓 error 行) ========"
-            grep -nE "error:|Error [0-9]" build.log | tail -40
-            echo "---------------- tail -40 ----------------"
-            tail -40 build.log
-            exit 1
+            echo "======== 失败,真错误 ========"; grep -nE "error:|Error [0-9]|undefined" build.log | tail -40; exit 1
           fi
-          echo "==== 编译成功 ===="
-          ls -lh out/arch/arm64/boot/
+          echo "==== 成功 ===="; ls -lh out/arch/arm64/boot/
           strings out/arch/arm64/boot/Image.gz* 2>/dev/null | grep -m1 "Linux version" || true
 
-      - name: 打包 AnyKernel3 卡刷包
+      - name: 打包 AnyKernel3
         run: |
           git clone https://github.com/osm0sis/AnyKernel3 --depth=1
           cd AnyKernel3
@@ -149,22 +153,20 @@ jobs:
           if   [ -f ../kernel/out/arch/arm64/boot/Image.gz-dtb ]; then cp ../kernel/out/arch/arm64/boot/Image.gz-dtb ./Image.gz
           elif [ -f ../kernel/out/arch/arm64/boot/Image.gz ];     then cp ../kernel/out/arch/arm64/boot/Image.gz ./Image.gz
           else cp ../kernel/out/arch/arm64/boot/Image ./Image; fi
-          ls -l Image*
           sed -i 's/device.name1=.*/device.name1=polaris/' anykernel.sh
           sed -i 's|block=.*|block=/dev/block/bootdevice/by-name/boot;|' anykernel.sh
-          zip -r9 ../polaris-ksu-full-$(date +%Y%m%d).zip *
-          cd ..
-          unzip -l polaris-ksu-full-*.zip | head -20
+          zip -r9 ../polaris-ksu-$(date +%Y%m%d).zip *
+          cd ..; unzip -l polaris-ksu-*.zip | head -20
 
       - uses: actions/upload-artifact@v4
         with:
-          name: polaris-ksu-满血root包
-          path: polaris-ksu-full-*.zip
+          name: polaris-ksu-zip
+          path: polaris-ksu-*.zip
           retention-days: 30
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: 编译日志
+          name: build-log
           path: kernel/build.log
           if-no-files-found: ignore
