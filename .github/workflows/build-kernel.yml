@@ -36,7 +36,7 @@ jobs:
             exit 1
           fi
           echo "== using: $Z =="
-          cp "$Z" ksu_src.zip
+          [ "$Z" = "ksu_src.zip" ] || cp -f "$Z" ksu_src.zip
           python3 - <<'PY'
           import zipfile, sys
           try:
