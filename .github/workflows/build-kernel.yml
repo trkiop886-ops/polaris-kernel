@@ -75,8 +75,7 @@ jobs:
           def read(p): return open(p).read()
           def write(p, s): open(p, 'w').write(s)
           def ins_after(path, anchor, block):
-              s = read(path)
-              i = s.find(anchor)
+              s = read(path); i = s.find(anchor)
               if i < 0:
                   print('  [MISS]', path); return
               write(path, s[:i+len(anchor)] + block + s[i+len(anchor):]); print('  [OK] after', path)
@@ -99,8 +98,8 @@ jobs:
               if i < 0:
                   print('  [MISS]', path); return
               write(path, s[:i] + block + s[i:]); print('  [OK] before', path)
-          ins_after('fs/exec.c', '#include <linux/binfmts.h>', '\n#ifdef CONFIG_KSU\nextern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,\n\t\t\t\tvoid *argv, void *envp, int *flags);\n#endif\n')
-          ins_inside('fs/exec.c', 'do_execveat_common(int fd, struct filename *filename,', '\n#ifdef CONFIG_KSU\n\tif (ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags))\n\t\treturn -EPERM;\n#endif')
+          ins_after('fs/exec.c', '#include <linux/binfmts.h>', '\n#ifdef CONFIG_KSU\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n#endif\n')
+          ins_inside('fs/exec.c', 'do_execveat_common(int fd, struct filename *filename,', '\n#ifdef CONFIG_KSU\n\tif (ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags))\n\t\treturn -EPERM;\n#endif')
           ins_before('fs/open.c', 'SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)', '\n#ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,\n\t\t\t\tint *__unused_flags);\n#endif\n')
           ins_inside('fs/open.c', 'SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)', '\n#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif')
           ins_before('fs/stat.c', '#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)', '\n#ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n#endif\n')
@@ -108,8 +107,8 @@ jobs:
           ins_inside('fs/stat.c', 'SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,', '\n#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif')
           print('hooks applied')
           PY
-          echo "== hooks check (2 / 2 / 3) =="
-          grep -c ksu_handle_execveat_sucompat fs/exec.c
+          echo "== hooks check (期望 2 / 2 / 3) =="
+          grep -c ksu_handle_execveat fs/exec.c
           grep -c ksu_handle_faccessat fs/open.c
           grep -c ksu_handle_stat fs/stat.c
 
