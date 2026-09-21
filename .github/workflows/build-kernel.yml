@@ -1,4 +1,4 @@
-name: Build Polaris Kernel (lineage-21 + clang17 + SukiSU + ksud fix)
+name: Build Polaris Kernel (lineage-21 + clang17 + SukiSU + ksud fix + multimode)
 
 on:
   workflow_dispatch:
@@ -105,6 +105,24 @@ jobs:
           grep -c ksu_handle_stat fs/stat.c
           grep -c ksu_handle_sys_reboot kernel/reboot.c
 
+      - name: patch-driver-multimode
+        run: |
+          cd kernel
+          python3 - <<'PY'
+          p = 'drivers/gpu/drm/msm/dsi-staging/dsi_panel.c'
+          s = open(p).read()
+          old = "\t/* No multiresolution support is available for video mode panels */\n\tif (panel->panel_mode != DSI_OP_CMD_MODE)\n\t\tcount = SINGLE_MODE_SUPPORT;\n"
+          new = "\t/* PATCHED: allow multi-timing for video mode panels (same resolution, different fps) */\n\t(void)SINGLE_MODE_SUPPORT;\n"
+          if old in s:
+              open(p, 'w').write(s.replace(old, new, 1))
+              print('[OK] dsi_panel.c patched: multi-timing enabled for video mode')
+          else:
+              print('[MISS] target block not found - check kernel source!')
+          PY
+          echo "== 校验 =="
+          grep -n "PATCHED: allow multi-timing" drivers/gpu/drm/msm/dsi-staging/dsi_panel.c || echo "  !! 补丁没打上"
+          grep -c "SINGLE_MODE_SUPPORT" drivers/gpu/drm/msm/dsi-staging/dsi_panel.c
+
       - name: write-config
         run: |
           cd kernel
@@ -164,14 +182,14 @@ jobs:
           fi
           sed -i 's/device.name1=.*/device.name1=polaris/' anykernel.sh
           sed -i 's|block=.*|block=/dev/block/bootdevice/by-name/boot;|' anykernel.sh
-          zip -r9 ../polaris-ksu-ksudfix-$(date +%Y%m%d).zip *
+          zip -r9 ../polaris-ksu-mm-$(date +%Y%m%d).zip *
           cd ..
-          unzip -l polaris-ksu-ksudfix-*.zip | head -20
+          unzip -l polaris-ksu-mm-*.zip | head -20
 
       - uses: actions/upload-artifact@v4
         with:
-          name: polaris-ksu-ksudfix-zip
-          path: polaris-ksu-ksudfix-*.zip
+          name: polaris-ksu-mm-zip
+          path: polaris-ksu-mm-*.zip
           retention-days: 30
 
       - uses: actions/upload-artifact@v4
